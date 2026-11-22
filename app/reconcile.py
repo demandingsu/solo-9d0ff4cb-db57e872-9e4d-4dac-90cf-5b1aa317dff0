@@ -12,15 +12,23 @@
 
 关键约束：计算合计与次数时**不枚举全部匹配路径**。
 归属有效期为 [起日, 止日)，归口同理（含起日、不含止日）。
+
+批量核对按拨款日升序做一次“有效期扫描”：
+- 底表每行只在起日进入活动集、在止日退出活动集各一次，整批复用；
+- 活动集按“项目号 -> 学院 -> 条数”“学院 -> 统计单位 -> 条数”聚合，
+  单笔拨款只需读取当日命中的学院及其统计单位；
+- 同一拨款日、同一项目只计算一次学院/单位分布，供该日多笔拨款复用；
+- 只有多计单需要展示示例路径时，才对至多 2 条路径做有界取样。
 """
 
 from __future__ import annotations
 
 import csv
+import heapq
 import io
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # 各文件期望列名（顺序固定，首行表头必须完全一致）
 GRANT_COLUMNS = ["单号", "项目号", "拨款日", "金额_分"]
@@ -119,6 +127,33 @@ class GrantEntry:
 
 
 @dataclass
+class RunStats:
+    """核对过程中的底表访问统计，用于核对“整批复用底表”的实测口径。"""
+
+    attribution_rows_indexed: int = 0
+    jurisdiction_rows_indexed: int = 0
+    attribution_sweep_steps: int = 0
+    jurisdiction_sweep_steps: int = 0
+    slice_reuses: int = 0
+    sample_row_reads: int = 0
+
+    @property
+    def base_row_checks(self) -> int:
+        """本次核对实际查看的底表行事件数（替代逐笔重扫历史行）。"""
+        return self.attribution_sweep_steps + self.jurisdiction_sweep_steps
+
+
+@dataclass
+class UnitSlice:
+    """某项目在某个拨款日命中的学院与统计单位分布（同日同项目可复用）。"""
+
+    college_counts: Dict[str, int]        # 学院 -> 当日有效归属行数
+    unit_counts: Dict[str, int]           # 统计单位 -> 路径数
+    # 多计示例路径按需生成一次（该日该项目所有多计单共用）
+    sample_paths: Optional[List["MatchPath"]] = None
+
+
+@dataclass
 class Report:
     total_grants: int
     normal_grants: int
@@ -128,6 +163,7 @@ class Report:
     overcounted: List[OvercountedGrant]
     entries: List[GrantEntry]
     grand_total: int                      # 所有统计单位合计（分）
+    stats: RunStats = field(default_factory=RunStats)
 
 
 # --------------------------------------------------------------------------- #
@@ -300,22 +336,77 @@ def parse_jurisdictions(raw: bytes, label: str = JURISDICTION_FILE) -> List[Juri
 
 
 # --------------------------------------------------------------------------- #
-# 索引与两层连接
+# 有效期扫描与两层连接
 # --------------------------------------------------------------------------- #
-def _active(rows: List[Tuple[date, date, object]], day: date) -> List[object]:
-    """有效期 [start, end) 覆盖 day 的行（线性扫描，不展开任何组合）。"""
-    return [obj for start, end, obj in rows if start <= day < end]
+def _sweep_events(
+    rows: Iterable[Tuple[date, date, int]],
+) -> List[Tuple[date, int, int]]:
+    """把区间行转成 (日期, 序号, +1/-1) 事件并按日期排序。
+
+    每行只在起日加入、止日退出各一次，整批拨款共用这一次扫描。
+    """
+    events: List[Tuple[date, int, int]] = []
+    for start, end, seq in rows:
+        events.append((start, seq, 1))
+        events.append((end, seq, -1))
+    events.sort(key=lambda e: (e[0], e[1]))
+    return events
+
+
+class _ActiveRows:
+    """当日有效行的上传序号，按需按上传行序惰性遍历。
+
+    加入/移除均为 O(log n)/O(1)；失效序号留在堆里，遍历时顺手丢弃。
+    只有需要展示示例路径时才遍历，取够两条即停。
+
+    遍历是一个上下文管理器：提前 break 时也会立即把已弹出但未消费的
+    有效序号放回，避免依赖垃圾回收时机。
+    """
+
+    __slots__ = ("_heap", "_alive", "_pending")
+
+    def __init__(self) -> None:
+        self._heap: List[int] = []
+        self._alive: set = set()
+        self._pending: List[int] = []
+
+    def add(self, seq: int) -> None:
+        self._alive.add(seq)
+        heapq.heappush(self._heap, seq)
+
+    def remove(self, seq: int) -> None:
+        self._alive.discard(seq)
+
+    def __enter__(self) -> "_ActiveRows":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        for seq in self._pending:
+            heapq.heappush(self._heap, seq)
+        self._pending.clear()
+
+    def __iter__(self):
+        """按上传行序产出仍有效的序号；须在 with 块中使用。"""
+        while self._heap:
+            seq = heapq.heappop(self._heap)
+            if seq in self._alive:
+                self._pending.append(seq)
+                yield seq
 
 
 def reconcile(
     grants_raw: bytes,
     attributions_raw: bytes,
     jurisdictions_raw: bytes,
+    stats: Optional[RunStats] = None,
 ) -> Report:
-    """执行两层内连接核对。
+    """执行两层内连接核对（按拨款日批量扫描有效期）。
 
-    合计与次数的复杂度为 O(匹配到的归属行数 + 这些学院下的归口行数)，
-    与完整路径总数（两者乘积）无关，因此不枚举任何匹配路径。
+    底表每行只在起日/止日各处理一次，活动集按项目→学院→条数、
+    学院→统计单位→条数聚合；单笔拨款只读取当日命中的学院与统计单位，
+    不逐笔重扫历史行，也不展开归属×归口的完整匹配路径。
+
+    ``stats`` 可传入 RunStats 收集底表访问次数（用于前后对比与自测）。
     """
     # 三个文件一起解析，汇总全部错误后一次性退回
     errors: List[Tuple[str, Optional[int], str]] = []
@@ -334,14 +425,61 @@ def reconcile(
     if errors:
         raise InputError(errors)
 
-    # 归属：项目号 -> [(起日, 止日, 行)]；归口：学院码 -> [(起日, 止日, 行)]
-    attr_index: Dict[str, List[Tuple[date, date, AttributionRow]]] = {}
-    for row in attributions:
-        attr_index.setdefault(row.project, []).append((row.start, row.end, row))
+    stats = stats if stats is not None else RunStats()
+    stats.attribution_rows_indexed = len(attributions)
+    stats.jurisdiction_rows_indexed = len(jurisdictions)
 
-    jur_index: Dict[str, List[Tuple[date, date, JurisdictionRow]]] = {}
-    for row in jurisdictions:
-        jur_index.setdefault(row.college, []).append((row.start, row.end, row))
+    # 上传行序 = 解析顺序；示例路径必须按此顺序取前两条
+    attr_events = _sweep_events(
+        (row.start, row.end, seq) for seq, row in enumerate(attributions)
+    )
+    jur_events = _sweep_events(
+        (row.start, row.end, seq) for seq, row in enumerate(jurisdictions)
+    )
+
+    # 活动集聚合：项目 -> 学院 -> 条数；学院 -> 统计单位 -> 条数
+    attr_active: Dict[str, Dict[str, int]] = {}
+    attr_active_rows: Dict[str, _ActiveRows] = {}   # 项目 -> 当日有效归属行
+    jur_active: Dict[str, Dict[str, int]] = {}
+    jur_active_rows: Dict[str, _ActiveRows] = {}    # 学院 -> 当日有效归口行
+
+    def add_attr(seq: int) -> None:
+        row = attributions[seq]
+        colleges = attr_active.setdefault(row.project, {})
+        colleges[row.college] = colleges.get(row.college, 0) + 1
+        active = attr_active_rows.get(row.project)
+        if active is None:
+            active = attr_active_rows[row.project] = _ActiveRows()
+        active.add(seq)
+
+    def remove_attr(seq: int) -> None:
+        row = attributions[seq]
+        colleges = attr_active[row.project]
+        left = colleges[row.college] - 1
+        if left:
+            colleges[row.college] = left
+        else:
+            del colleges[row.college]
+        attr_active_rows[row.project].remove(seq)
+
+    def add_jur(seq: int) -> None:
+        row = jurisdictions[seq]
+        units = jur_active.setdefault(row.college, {})
+        units[row.unit] = units.get(row.unit, 0) + 1
+        active = jur_active_rows.get(row.college)
+        if active is None:
+            active = jur_active_rows[row.college] = _ActiveRows()
+        active.add(seq)
+
+    def remove_jur(seq: int) -> None:
+        row = jurisdictions[seq]
+        units = jur_active[row.college]
+        left = units[row.unit] - 1
+        if left:
+            units[row.unit] = left
+        else:
+            del units[row.unit]
+        jur_active_rows[row.college].remove(seq)
 
     unit_totals: Dict[str, int] = {}
     unit_path_counts: Dict[str, int] = {}
@@ -350,12 +488,47 @@ def reconcile(
     entries: List[GrantEntry] = []
     normal = 0
 
-    for grant in grants:
-        # ---- 第一层：项目号 + 拨款日落入归属有效期 ----
-        attr_hits: List[AttributionRow] = _active(
-            attr_index.get(grant.project, []), grant.grant_date
-        )
-        if not attr_hits:
+    # 按拨款日升序扫描；同一拨款日只推进一次事件指针
+    ordered = sorted(grants, key=lambda g: (g.grant_date, g.grant_no))
+    attr_pos = jur_pos = 0
+    current_day: Optional[date] = None
+    slices: Dict[str, UnitSlice] = {}   # 当日 项目号 -> 命中分布
+
+    for grant in ordered:
+        day = grant.grant_date
+        if day != current_day:
+            current_day = day
+            slices.clear()
+            while attr_pos < len(attr_events) and attr_events[attr_pos][0] <= day:
+                _, seq, delta = attr_events[attr_pos]
+                stats.attribution_sweep_steps += 1
+                if delta == 1:
+                    add_attr(seq)
+                else:
+                    remove_attr(seq)
+                attr_pos += 1
+            while jur_pos < len(jur_events) and jur_events[jur_pos][0] <= day:
+                _, seq, delta = jur_events[jur_pos]
+                stats.jurisdiction_sweep_steps += 1
+                if delta == 1:
+                    add_jur(seq)
+                else:
+                    remove_jur(seq)
+                jur_pos += 1
+
+        slice_ = slices.get(grant.project)
+        if slice_ is None:
+            college_counts = dict(attr_active.get(grant.project, {}))
+            unit_counts: Dict[str, int] = {}
+            for college, n_attr in college_counts.items():
+                for unit, n_jur in jur_active.get(college, {}).items():
+                    unit_counts[unit] = unit_counts.get(unit, 0) + n_attr * n_jur
+            slice_ = UnitSlice(college_counts, unit_counts)
+            slices[grant.project] = slice_
+        else:
+            stats.slice_reuses += 1
+
+        if not slice_.college_counts:
             missed.append(
                 MissedGrant(
                     grant.grant_no, grant.project, grant.grant_date,
@@ -370,41 +543,12 @@ def reconcile(
             )
             continue
 
-        # ---- 第二层：按命中归属行的学院码，找拨款日有效的归口行 ----
-        # 不构造 (归属行 × 归口行) 的笛卡尔积：
-        # 先按学院聚合归口行数，再用 归属行数 × 学院归口行数 做加权计数。
-        college_jur: Dict[str, List[JurisdictionRow]] = {}
-        for attr in attr_hits:
-            if attr.college not in college_jur:
-                college_jur[attr.college] = _active(
-                    jur_index.get(attr.college, []), grant.grant_date
-                )
-
-        # 学院 -> 拨款日有效的归属行数（同学院多条归属行各自是独立路径）
-        attr_count_by_college: Dict[str, int] = {}
-        for attr in attr_hits:
-            attr_count_by_college[attr.college] = (
-                attr_count_by_college.get(attr.college, 0) + 1
-            )
-
-        total_paths = 0
-        per_unit: Dict[str, int] = {}
-        for college, jur_rows in college_jur.items():
-            n_attr = attr_count_by_college[college]
-            for jur in jur_rows:
-                paths = n_attr  # 该归口行与 n_attr 条归属行各组成一条路径
-                total_paths += paths
-                per_unit[jur.unit] = per_unit.get(jur.unit, 0) + paths
-                unit_path_counts[jur.unit] = unit_path_counts.get(jur.unit, 0) + paths
-                unit_totals[jur.unit] = (
-                    unit_totals.get(jur.unit, 0) + paths * grant.amount
-                )
-
+        total_paths = sum(slice_.unit_counts.values())
         if total_paths == 0:
             missed.append(
                 MissedGrant(
                     grant.grant_no, grant.project, grant.grant_date,
-                    grant.amount, "归口层", len(attr_hits),
+                    grant.amount, "归口层", sum(slice_.college_counts.values()),
                 )
             )
             entries.append(
@@ -414,6 +558,11 @@ def reconcile(
                 )
             )
             continue
+
+        per_unit = slice_.unit_counts
+        for unit, paths in per_unit.items():
+            unit_path_counts[unit] = unit_path_counts.get(unit, 0) + paths
+            unit_totals[unit] = unit_totals.get(unit, 0) + paths * grant.amount
 
         entries.append(
             GrantEntry(
@@ -426,21 +575,37 @@ def reconcile(
             normal += 1
             continue
 
-        # 多计：仅为展示取至多 2 条示例路径（有界采样，不枚举全部路径）
-        sample: List[MatchPath] = []
-        for attr in attr_hits:
-            for jur in college_jur.get(attr.college, []):
-                sample.append(
-                    MatchPath(attr.line_no, jur.line_no, attr.college, jur.unit)
-                )
-                if len(sample) == 2:
-                    break
-            if len(sample) == 2:
-                break
+        # 多计：按上传行序取至多 2 条示例路径（有界取样，该日该项目只取一次）
+        if slice_.sample_paths is None:
+            sample: List[MatchPath] = []
+            active_attrs = attr_active_rows.get(grant.project)
+            if active_attrs is not None:
+                with active_attrs:
+                    for attr_seq in active_attrs:
+                        if len(sample) >= 2:
+                            break
+                        stats.sample_row_reads += 1
+                        attr = attributions[attr_seq]
+                        active_jurs = jur_active_rows.get(attr.college)
+                        if active_jurs is None:
+                            continue
+                        with active_jurs:
+                            for jur_seq in active_jurs:
+                                if len(sample) >= 2:
+                                    break
+                                stats.sample_row_reads += 1
+                                jur = jurisdictions[jur_seq]
+                                sample.append(
+                                    MatchPath(attr.line_no, jur.line_no,
+                                              attr.college, jur.unit)
+                                )
+            slice_.sample_paths = sample
+
         overcounted.append(
             OvercountedGrant(
                 grant.grant_no, grant.project, grant.grant_date,
-                grant.amount, total_paths, sample, dict(sorted(per_unit.items())),
+                grant.amount, total_paths, list(slice_.sample_paths),
+                dict(sorted(per_unit.items())),
             )
         )
 
@@ -456,4 +621,5 @@ def reconcile(
         overcounted=overcounted,
         entries=entries,
         grand_total=sum(unit_totals.values()),
+        stats=stats,
     )

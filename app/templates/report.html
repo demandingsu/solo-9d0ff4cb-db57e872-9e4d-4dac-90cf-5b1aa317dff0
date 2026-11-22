@@ -16,6 +16,15 @@
     归属表 <code>{{ file_names["归属表"] }}</code> ·
     归口表 <code>{{ file_names["归口表"] }}</code>
   </p>
+  {% if report.stats %}
+  <p class="muted" style="margin-top:6px">
+    底表扫描：归属表 {{ report.stats.attribution_rows_indexed }} 行、归口表
+    {{ report.stats.jurisdiction_rows_indexed }} 行，整批共做
+    <b>{{ report.stats.base_row_checks }}</b> 次行事件检查（每行仅在起日进入、
+    止日退出各一次）；同日同项目分布复用 {{ report.stats.slice_reuses }} 次，
+    示例路径仅读取 {{ report.stats.sample_row_reads }} 条行。
+  </p>
+  {% endif %}
 </div>
 
 <div class="card">

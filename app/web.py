@@ -6,7 +6,7 @@ import os
 
 from flask import Flask, render_template, request, send_from_directory
 
-from .reconcile import InputError, reconcile
+from .reconcile import InputError, RunStats, reconcile
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 SAMPLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
@@ -52,10 +52,12 @@ def check():
         return render_template("error.html", errors=missing), 400
 
     try:
+        stats = RunStats()
         report = reconcile(
             files["grants"][1],
             files["attributions"][1],
             files["jurisdictions"][1],
+            stats=stats,
         )
     except InputError as exc:
         # 本次核对整次退回，不落库、不产生部分结果

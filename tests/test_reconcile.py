@@ -29,6 +29,7 @@ from app.reconcile import (  # noqa: E402
     GRANT_FILE,
     InputError,
     JURISDICTION_FILE,
+    RunStats,
     reconcile,
 )
 
@@ -205,11 +206,13 @@ def test_massive():
     for j in range(1, n_jur + 1):
         jur_rows.append([1000 + j, "C1", "U1", "2026-01-01", "2027-01-01"])
 
+    stats = RunStats()
     started = time.perf_counter()
     report = reconcile(
         grants.encode(),
         csv_bytes(attr_rows).encode(),
         csv_bytes(jur_rows).encode(),
+        stats=stats,
     )
     elapsed = time.perf_counter() - started
 
@@ -219,8 +222,49 @@ def test_massive():
     check(report.unit_path_counts == {"U1": expected}, "单位次数 48 万")
     check(report.unit_totals == {"U1": expected * 1000}, "单位合计 = 次数 × 金额")
     check(len(report.overcounted[0].sample_paths) == 2, "示例路径仍只取 2 条（有界）")
+    check(stats.attribution_sweep_steps == n_attr
+          and stats.jurisdiction_sweep_steps == n_jur,
+          "底表每行只扫描一次（600+800 步），不随路径数增长")
+    check(stats.sample_row_reads <= 3, "只为示例读取至多 3 条底表行")
     check(elapsed < 2.0, f"耗时 {elapsed*1000:.1f}ms < 2s（与路径总数无关的线性复杂度）")
     print(f"       （480,000 路径，引擎实际构造的路径对象仅 2 个，用时 {elapsed*1000:.1f}ms）")
+
+
+# --------------------------------------------------------------------------- #
+# 3b. 生效与到期相接 + 同日复用
+# --------------------------------------------------------------------------- #
+def test_adjacent_intervals():
+    print("[3b] 有效期首尾相接：换窗当天只命中后一段（含起不含止）")
+    attrs = csv_bytes([
+        ATTR_HEADER,
+        [1, "P1", "C1", "2026-01-01", "2026-06-30"],   # A 止日 = 接缝
+        [2, "P1", "C1", "2026-06-30", "2027-01-01"],   # B 起日 = 接缝
+        [3, "P2", "C1", "2026-01-01", "2027-01-01"],
+    ])
+    jurs = csv_bytes([
+        JUR_HEADER,
+        [10, "C1", "U1", "2026-01-01", "2026-06-30"],
+        [11, "C1", "U2", "2026-06-30", "2027-01-01"],
+    ])
+
+    def run(day):
+        g = csv_bytes([GRANT_HEADER, ["G1", "P1", day, 100]]).encode()
+        return reconcile(g, attrs.encode(), jurs.encode())
+
+    r = run("2026-06-29")
+    check(r.entries[0].path_count == 1 and r.unit_path_counts == {"U1": 1},
+          "接缝前一天只命中 A 段（U1）")
+    r = run("2026-06-30")
+    check(r.entries[0].path_count == 1 and r.unit_path_counts == {"U2": 1},
+          "接缝当天 A 已失效、B 已生效，只命中一次（U2），不重不漏")
+
+    # 同日同项目多笔：分布复用一次，但每笔都独立入表/倍乘
+    grants = [GRANT_HEADER]
+    for i in range(10):
+        grants.append([f"G{i:03d}", "P2", "2026-03-15", 100 + i])
+    report = reconcile(csv_bytes(grants).encode(), attrs.encode(), jurs.encode())
+    check(report.unit_path_counts == {"U1": 10}, "同日 10 笔各计入 1 次（3 月仅 U1 有效）")
+    check(report.grand_total == sum(100 + i for i in range(10)), "同日多笔金额逐笔累加")
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +381,8 @@ def test_web():
         )
     check(resp.status_code == 200, "样例三表上传返回 200")
     body = resp.get_data(as_text=True)
-    for needle in ("各统计单位实际合计", "漏计单号", "多计单号", "G003", "G001", "行号 201"):
+    for needle in ("各统计单位实际合计", "漏计单号", "多计单号", "G003", "G001", "行号 201",
+                   "底表扫描"):
         check(needle in body, f"结果页包含 {needle}")
 
     # 错误输入：HTTP 400 + 文件行号定位 + 退回提示
@@ -370,7 +415,7 @@ def test_web():
 
 def main():
     for fn in (test_basic, test_half_open_boundary, test_overlapping_attribution,
-               test_massive, test_validation, test_web):
+               test_massive, test_adjacent_intervals, test_validation, test_web):
         try:
             fn()
         except Exception:  # noqa: BLE001
